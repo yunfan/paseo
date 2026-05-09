@@ -41,6 +41,7 @@ Environment variables:
 
 - `RELAY_BIND` default: `127.0.0.1:8787`
 - `RELAY_LOG` default: `info`
+- `RELAY_DIAGNOSTICS` default: `false`
 - `RELAY_INITIAL_NUDGE_MS` default: `10000`
 - `RELAY_SECOND_NUDGE_MS` default: `5000`
 - `RELAY_MAX_FRAME_BYTES` default: `65536`
@@ -53,6 +54,16 @@ Environment variables:
 
 All defaults are built into the binary. If an environment variable is unset, the
 compiled default is used automatically.
+
+Diagnostic logging:
+
+- Set `RELAY_DIAGNOSTICS=true` to emit additional startup and connection
+  lifecycle logs.
+- This includes effective startup config, query validation failures, sync
+  nudges, socket registration and teardown, buffering before server-data attach,
+  and rate-limit / frame-size / idle-timeout diagnostics.
+- When enabled, the event messages are emitted as Chinese labels so they are
+  easier to visually scan in operations logs.
 
 ## Test client
 

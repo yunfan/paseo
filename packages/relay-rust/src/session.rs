@@ -7,7 +7,7 @@ use serde_json::json;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::protocol::{ConnectionRole, RelayVersion};
@@ -185,6 +185,12 @@ impl RelaySession {
                     close_handle(&existing, 1008, "Replaced by new connection");
                 }
                 let connection_ids = collect_client_connection_ids(&state);
+                info!(
+                    server_id = %self.key.server_id,
+                    version = %self.key.version.as_str(),
+                    connection_ids = ?connection_ids,
+                    "控制通道发送初始同步"
+                );
                 let sync = json!({ "type": "sync", "connectionIds": connection_ids }).to_string();
                 send_or_close(&handle, OutboundMessage::Text(sync));
             }
@@ -195,6 +201,13 @@ impl RelaySession {
                 {
                     close_handle(&existing, 1008, "Replaced by new connection");
                 }
+                info!(
+                    server_id = %self.key.server_id,
+                    version = %self.key.version.as_str(),
+                    connection_id = %connection_id,
+                    pending_frames = state.pending.get(connection_id).map(VecDeque::len).unwrap_or(0),
+                    "服务端数据通道已注册"
+                );
                 flush_pending_locked(&mut state, connection_id, &handle);
             }
             PeerKind::V2Client { connection_id } => {
@@ -203,6 +216,13 @@ impl RelaySession {
                     return Err("Client connection limit exceeded");
                 }
                 clients.insert(handle.meta.peer_id, handle.clone());
+                info!(
+                    server_id = %self.key.server_id,
+                    version = %self.key.version.as_str(),
+                    connection_id = %connection_id,
+                    client_sockets = clients.len(),
+                    "客户端数据通道已注册"
+                );
                 notify_control_locked(
                     &state,
                     json!({ "type": "connected", "connectionId": connection_id }).to_string(),
@@ -246,6 +266,13 @@ impl RelaySession {
                 if let Some(server) = state.server_data.get(connection_id) {
                     forward_frame(server, relay_frame);
                 } else {
+                    info!(
+                        server_id = %self.key.server_id,
+                        version = %self.key.version.as_str(),
+                        connection_id = %connection_id,
+                        buffered_frames = state.pending.get(connection_id).map(VecDeque::len).unwrap_or(0) + 1,
+                        "服务端数据通道未就绪，先缓存客户端帧"
+                    );
                     buffer_pending_locked(&mut state, connection_id, relay_frame);
                 }
             }
@@ -299,8 +326,20 @@ impl RelaySession {
                     state.clients.remove(connection_id);
                     state.pending.remove(connection_id);
                     if let Some(server) = state.server_data.remove(connection_id) {
+                        info!(
+                            server_id = %self.key.server_id,
+                            version = %self.key.version.as_str(),
+                            connection_id = %connection_id,
+                            "最后一个客户端已断开，关闭对应服务端数据通道"
+                        );
                         close_handle(&server, 1001, "Client disconnected");
                     }
+                    info!(
+                        server_id = %self.key.server_id,
+                        version = %self.key.version.as_str(),
+                        connection_id = %connection_id,
+                        "会话已结束，向控制通道发送 disconnected"
+                    );
                     notify_control_locked(
                         &state,
                         json!({ "type": "disconnected", "connectionId": connection_id })
@@ -315,6 +354,13 @@ impl RelaySession {
                 ) {
                     state.server_data.remove(connection_id);
                 }
+                info!(
+                    server_id = %self.key.server_id,
+                    version = %self.key.version.as_str(),
+                    connection_id = %connection_id,
+                    client_sockets = state.clients.get(connection_id).map(HashMap::len).unwrap_or(0),
+                    "服务端数据通道已断开，关闭对应客户端通道"
+                );
                 if let Some(clients) = state.clients.get(connection_id) {
                     for client in clients.values() {
                         close_handle(client, 1012, "Server disconnected");
@@ -349,7 +395,7 @@ impl RelaySession {
             warn!(
                 server_id = %self.key.server_id,
                 connection_id = %connection_id,
-                "closing stale control socket after sync nudge"
+                "控制通道长时间无响应，执行主动重置"
             );
             close_handle(control, 1011, "Control unresponsive");
         }
@@ -372,6 +418,12 @@ impl RelaySession {
     async fn send_sync_to_control(&self) {
         let state = self.state.lock().await;
         let connection_ids = collect_client_connection_ids(&state);
+        info!(
+            server_id = %self.key.server_id,
+            version = %self.key.version.as_str(),
+            connection_ids = ?connection_ids,
+            "控制通道补发同步提示"
+        );
         notify_control_locked(
             &state,
             json!({ "type": "sync", "connectionIds": connection_ids }).to_string(),

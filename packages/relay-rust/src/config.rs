@@ -6,6 +6,7 @@ use crate::session::{RelayLimitsConfig, RelayTimingConfig};
 
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_LOG_FILTER: &str = "info";
+const DEFAULT_DIAGNOSTICS: bool = false;
 const DEFAULT_INITIAL_NUDGE_MS: u64 = 10_000;
 const DEFAULT_SECOND_NUDGE_MS: u64 = 5_000;
 const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -20,6 +21,7 @@ const DEFAULT_RATE_LIMIT_WINDOW_MS: u64 = 10_000;
 pub struct RelayConfig {
     pub bind_addr: SocketAddr,
     pub log_filter: String,
+    pub diagnostics: bool,
     pub timings: RelayTimingConfig,
     pub limits: RelayLimitsConfig,
 }
@@ -28,6 +30,7 @@ impl RelayConfig {
     pub fn from_env() -> Result<Self, String> {
         let bind_addr = parse_socket_addr("RELAY_BIND", DEFAULT_BIND)?;
         let log_filter = env::var("RELAY_LOG").unwrap_or_else(|_| DEFAULT_LOG_FILTER.to_string());
+        let diagnostics = parse_bool("RELAY_DIAGNOSTICS", DEFAULT_DIAGNOSTICS)?;
 
         let timings = RelayTimingConfig {
             initial_nudge_delay: duration_ms("RELAY_INITIAL_NUDGE_MS", DEFAULT_INITIAL_NUDGE_MS)?,
@@ -62,6 +65,7 @@ impl RelayConfig {
         Ok(Self {
             bind_addr,
             log_filter,
+            diagnostics,
             timings,
             limits,
         })
@@ -78,6 +82,17 @@ fn parse_usize(key: &str, default: usize) -> Result<usize, String> {
     let raw = env::var(key).unwrap_or_else(|_| default.to_string());
     raw.parse::<usize>()
         .map_err(|error| format!("{key} must be a positive integer: {error}"))
+}
+
+fn parse_bool(key: &str, default: bool) -> Result<bool, String> {
+    let raw = env::var(key).unwrap_or_else(|_| default.to_string());
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "{key} must be a boolean (true/false, 1/0, yes/no, on/off)"
+        )),
+    }
 }
 
 fn duration_ms(key: &str, default_ms: u64) -> Result<Duration, String> {

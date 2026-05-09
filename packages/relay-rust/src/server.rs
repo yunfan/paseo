@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::protocol::{ConnectionRole, HealthResponse, RelayVersion, WsParams};
 use crate::session::{
@@ -24,6 +24,7 @@ use crate::session::{
 pub struct AppState {
     registry: Arc<SessionRegistry>,
     limits: RelayLimitsConfig,
+    diagnostics: bool,
 }
 
 impl Default for AppState {
@@ -37,7 +38,13 @@ impl AppState {
         Self {
             registry: Arc::new(SessionRegistry::new(timings, limits.clone())),
             limits,
+            diagnostics: false,
         }
+    }
+
+    pub fn with_diagnostics(mut self, diagnostics: bool) -> Self {
+        self.diagnostics = diagnostics;
+        self
     }
 }
 
@@ -57,7 +64,7 @@ pub async fn run_server_with_state(
     state: AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(bind_addr).await?;
-    info!(%bind_addr, "relay-rust listening");
+    info!(%bind_addr, "中继服务已监听");
     axum::serve(listener, app(state)).await?;
     Ok(())
 }
@@ -66,7 +73,7 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RawWsParams {
     #[serde(rename = "serverId")]
     server_id: Option<String>,
@@ -83,28 +90,59 @@ async fn ws_handler(
 ) -> Response {
     let params = match validate_params(raw) {
         Ok(params) => params,
-        Err((status, message)) => return (status, message).into_response(),
+        Err((status, message, raw_query)) => {
+            if state.diagnostics {
+                warn!(
+                    status = status.as_u16(),
+                    message,
+                    raw_query = ?raw_query,
+                    "参数校验失败"
+                );
+            }
+            return (status, message).into_response();
+        }
     };
     let Some(ws) = ws else {
+        if state.diagnostics {
+            warn!(
+                server_id = %params.server_id,
+                role = %params.role.as_str(),
+                version = %params.version.as_str(),
+                connection_id = params.connection_id.as_deref().unwrap_or(""),
+                "请求缺少 WebSocket Upgrade 头"
+            );
+        }
         return (StatusCode::UPGRADE_REQUIRED, "Expected WebSocket upgrade").into_response();
     };
 
     ws.on_upgrade(move |socket| handle_socket(state, params, socket))
 }
 
-fn validate_params(raw: RawWsParams) -> Result<WsParams, (StatusCode, &'static str)> {
+fn validate_params(
+    raw: RawWsParams,
+) -> Result<WsParams, (StatusCode, &'static str, RawWsParams)> {
+    let raw_query = RawWsParams {
+        server_id: raw.server_id.clone(),
+        role: raw.role.clone(),
+        v: raw.v.clone(),
+        connection_id: raw.connection_id.clone(),
+    };
     let server_id = raw
         .server_id
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or((StatusCode::BAD_REQUEST, "Missing serverId parameter"))?;
+        .ok_or((StatusCode::BAD_REQUEST, "Missing serverId parameter", raw_query.clone()))?;
     let role = raw
         .role
         .as_deref()
         .and_then(ConnectionRole::parse)
-        .ok_or((StatusCode::BAD_REQUEST, "Missing or invalid role parameter"))?;
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Missing or invalid role parameter",
+            raw_query.clone(),
+        ))?;
     let version = RelayVersion::parse(raw.v.as_deref())
-        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+        .map_err(|message| (StatusCode::BAD_REQUEST, message, raw_query.clone()))?;
     let connection_id = raw
         .connection_id
         .map(|value| value.trim().to_string())
@@ -129,9 +167,19 @@ async fn handle_socket(state: AppState, params: WsParams, socket: WebSocket) {
         role = %peer_meta.role.as_str(),
         version = %peer_meta.version.as_str(),
         connection_id = peer_meta.connection_id.as_deref().unwrap_or(""),
-        "relay socket connected"
+        "连接已建立"
     );
-    run_peer(session, state.limits, peer_meta, socket).await;
+    run_peer(session, state.limits, state.diagnostics, peer_meta, socket).await;
+}
+
+fn close_scene(meta: &PeerMeta) -> &'static str {
+    match &meta.kind {
+        PeerKind::V1Server => "v1服务端",
+        PeerKind::V1Client => "v1客户端",
+        PeerKind::V2ServerControl => "控制通道",
+        PeerKind::V2ServerData { .. } => "服务端数据通道",
+        PeerKind::V2Client { .. } => "客户端数据通道",
+    }
 }
 
 fn build_peer_meta(params: WsParams) -> PeerMeta {
@@ -166,6 +214,7 @@ fn build_peer_meta(params: WsParams) -> PeerMeta {
 async fn run_peer(
     session: Arc<RelaySession>,
     limits: RelayLimitsConfig,
+    diagnostics: bool,
     meta: PeerMeta,
     socket: WebSocket,
 ) {
@@ -176,6 +225,17 @@ async fn run_peer(
     };
 
     if let Err(reason) = session.register(handle.clone()).await {
+        if diagnostics {
+            warn!(
+                server_id = %meta.server_id,
+                role = %meta.role.as_str(),
+                version = %meta.version.as_str(),
+                connection_id = meta.connection_id.as_deref().unwrap_or(""),
+                scene = close_scene(&meta),
+                reason,
+                "连接注册被拒绝"
+            );
+        }
         let (mut sender, _) = socket.split();
         let _ = sender
             .send(Message::Close(Some(CloseFrame {
@@ -218,6 +278,17 @@ async fn run_peer(
         let Some(result) = (match next_message {
             Ok(value) => value,
             Err(_) => {
+                if diagnostics {
+                    info!(
+                        server_id = %meta.server_id,
+                        role = %meta.role.as_str(),
+                        version = %meta.version.as_str(),
+                        connection_id = meta.connection_id.as_deref().unwrap_or(""),
+                        scene = close_scene(&meta),
+                        idle_timeout_ms = limits.idle_timeout.as_millis(),
+                        "连接因空闲超时被关闭"
+                    );
+                }
                 let _ = handle.tx.try_send(OutboundMessage::Close {
                     code: 1001,
                     reason: "Idle timeout".to_string(),
@@ -234,6 +305,18 @@ async fn run_peer(
         }
         messages_in_window += 1;
         if messages_in_window > limits.max_messages_per_window {
+            if diagnostics {
+                warn!(
+                    server_id = %meta.server_id,
+                    role = %meta.role.as_str(),
+                    version = %meta.version.as_str(),
+                    connection_id = meta.connection_id.as_deref().unwrap_or(""),
+                    scene = close_scene(&meta),
+                    max_messages_per_window = limits.max_messages_per_window,
+                    rate_limit_window_ms = limits.rate_limit_window.as_millis(),
+                    "连接因消息速率超限被关闭"
+                );
+            }
             let _ = handle.tx.try_send(OutboundMessage::Close {
                 code: 1008,
                 reason: "Rate limit exceeded".to_string(),
@@ -244,6 +327,18 @@ async fn run_peer(
         match result {
             Ok(Message::Text(text)) => {
                 if text.len() > limits.max_frame_bytes {
+                    if diagnostics {
+                        warn!(
+                            server_id = %meta.server_id,
+                            role = %meta.role.as_str(),
+                            version = %meta.version.as_str(),
+                            connection_id = meta.connection_id.as_deref().unwrap_or(""),
+                            scene = close_scene(&meta),
+                            frame_bytes = text.len(),
+                            max_frame_bytes = limits.max_frame_bytes,
+                            "文本帧过大"
+                        );
+                    }
                     let _ = handle.tx.try_send(OutboundMessage::Close {
                         code: 1009,
                         reason: "Frame too large".to_string(),
@@ -254,6 +349,18 @@ async fn run_peer(
             }
             Ok(Message::Binary(bytes)) => {
                 if bytes.len() > limits.max_frame_bytes {
+                    if diagnostics {
+                        warn!(
+                            server_id = %meta.server_id,
+                            role = %meta.role.as_str(),
+                            version = %meta.version.as_str(),
+                            connection_id = meta.connection_id.as_deref().unwrap_or(""),
+                            scene = close_scene(&meta),
+                            frame_bytes = bytes.len(),
+                            max_frame_bytes = limits.max_frame_bytes,
+                            "二进制帧过大"
+                        );
+                    }
                     let _ = handle.tx.try_send(OutboundMessage::Close {
                         code: 1009,
                         reason: "Frame too large".to_string(),
@@ -268,14 +375,49 @@ async fn run_peer(
                 session.handle_ping(&meta, bytes.into()).await;
             }
             Ok(Message::Pong(_)) => {}
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(frame)) => {
+                if diagnostics {
+                    let (code, reason) = frame
+                        .map(|frame| (u16::from(frame.code), frame.reason.to_string()))
+                        .unwrap_or((1005, String::new()));
+                    info!(
+                        server_id = %meta.server_id,
+                        role = %meta.role.as_str(),
+                        version = %meta.version.as_str(),
+                        connection_id = meta.connection_id.as_deref().unwrap_or(""),
+                        scene = close_scene(&meta),
+                        close_code = code,
+                        close_reason = %reason,
+                        "收到对端关闭帧"
+                    );
+                }
+                break;
+            }
             Err(error) => {
-                error!(server_id = %meta.server_id, ?error, "relay socket receive error");
+                error!(
+                    server_id = %meta.server_id,
+                    role = %meta.role.as_str(),
+                    version = %meta.version.as_str(),
+                    connection_id = meta.connection_id.as_deref().unwrap_or(""),
+                    scene = close_scene(&meta),
+                    ?error,
+                    "连接接收数据异常"
+                );
                 break;
             }
         }
     }
 
+    if diagnostics {
+        info!(
+            server_id = %meta.server_id,
+            role = %meta.role.as_str(),
+            version = %meta.version.as_str(),
+            connection_id = meta.connection_id.as_deref().unwrap_or(""),
+            scene = close_scene(&meta),
+            "连接已断开"
+        );
+    }
     session.unregister(&meta).await;
     write_task.abort();
 }
